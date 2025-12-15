@@ -830,7 +830,9 @@ export class HeliusProvider extends BaseProvider {
   }
 
   /**
-   * Extract token mints from a transaction where address might be creator
+   * Extract token mints from a transaction where address is VERIFIED as creator
+   * Only returns tokens where we can confirm the address is the mint authority
+   * via InitializeMint instructions - NOT based on token amounts received
    */
   private extractTokenMintsFromTransaction(
     tx: any,
@@ -839,28 +841,35 @@ export class HeliusProvider extends BaseProvider {
     const tokens: TokenSummary[] = [];
 
     try {
-      // Look for large token transfers TO the creator (initial supply)
-      const tokenTransfers = tx.tokenTransfers || [];
+      // ONLY look for InitializeMint instructions where this address is mint authority
+      // Do NOT use token transfer amounts as heuristics - they cause false positives
+      const innerInstructions = tx.meta?.innerInstructions || [];
+      
+      for (const inner of innerInstructions) {
+        for (const ix of inner.instructions || []) {
+          if (
+            ix.parsed?.type === "initializeMint" ||
+            ix.parsed?.type === "initializeMint2"
+          ) {
+            const mintAuthority = ix.parsed?.info?.mintAuthority;
+            const mintAddress = ix.parsed?.info?.mint;
 
-      for (const transfer of tokenTransfers) {
-        if (
-          transfer.toUserAccount === creatorAddress &&
-          transfer.mint !== this.NATIVE_SOL_MINT
-        ) {
-          const tokenAmount = parseFloat(transfer.tokenAmount || "0");
-
-          // If creator receives large amount, likely initial supply
-          if (tokenAmount > 10000) {
-            tokens.push({
-              token: transfer.mint,
-              name: "Token",
-              symbol: "TOKEN",
-              launchAt: tx.blockTime
-                ? new Date(tx.blockTime * 1000).toISOString()
-                : new Date().toISOString(),
-              initialLiquidity: 0,
-              currentLiquidity: 0,
-            });
+            // STRICT: Only include if this address is the mint authority
+            if (mintAuthority === creatorAddress && mintAddress) {
+              tokens.push({
+                token: mintAddress,
+                name: "Token",
+                symbol: "TOKEN",
+                launchAt: tx.blockTime
+                  ? new Date(tx.blockTime * 1000).toISOString()
+                  : new Date().toISOString(),
+                initialLiquidity: 0,
+                currentLiquidity: 0,
+              });
+              console.log(
+                `[Helius] Found token via InitializeMint: ${mintAddress.slice(0, 8)}...`
+              );
+            }
           }
         }
       }
@@ -1055,12 +1064,14 @@ export class HeliusProvider extends BaseProvider {
 
   /**
    * Check if a transaction is a token CREATION (not just any interaction)
-   * We need to be strict here to only return tokens actually created by this wallet
+   * We need to be VERY STRICT here to only return tokens actually created by this wallet
    *
-   * Token creation indicators:
-   * 1. Transaction type is "TOKEN_MINT" and wallet is fee payer
-   * 2. Transaction source is "PUMP_FUN" with type "CREATE"
-   * 3. Has InitializeMint instruction with wallet as mint authority
+   * STRICT Token creation indicators (must match one of these):
+   * 1. Transaction type is explicitly "CREATE" or "CREATE_POOL"
+   * 2. Has InitializeMint instruction with wallet as mint authority
+   * 3. Description explicitly says "created" AND wallet is fee payer
+   *
+   * We do NOT use heuristics like token amounts or ratios as these cause false positives
    */
   private isPumpFunCreate(tx: any, walletAddress: string): boolean {
     const description = (tx.description || "").toLowerCase();
@@ -1073,111 +1084,37 @@ export class HeliusProvider extends BaseProvider {
       return false;
     }
 
-    // For pump.fun specifically - check source and type FIRST
-    // Pump.fun token interactions are categorized as SWAP, so we need to handle them specially
+    // For pump.fun specifically - ONLY accept explicit creation transactions
     if (
       source === "PUMP_FUN" ||
       source === "PUMP.FUN" ||
       source === "PUMP_AMM"
     ) {
-      // CREATE or CREATE_POOL are explicit token creation transactions
+      // CREATE or CREATE_POOL are explicit token creation transactions - this is the ONLY reliable indicator
       if (txType === "CREATE" || txType === "CREATE_POOL") {
         console.log(`[Helius] Found PUMP_FUN ${txType}: ${tx.signature}`);
         return true;
       }
 
-      // For SWAP transactions on pump.fun, check if this is the FIRST transaction for this token
-      // The most reliable indicator is: wallet receives tokens for the FIRST TIME for this mint
+      // Check if description explicitly mentions creation by this wallet
+      // Must be very specific - "created" alone is not enough, need context
+      if (
+        description.includes("created") &&
+        (description.includes("token") || description.includes("launched"))
+      ) {
+        console.log(
+          `[Helius] Found PUMP_FUN creation via description: ${tx.signature}`
+        );
+        return true;
+      }
+
+      // For SWAP transactions - these are BUYS/SELLS, NOT creations
+      // Do NOT use heuristics like token amounts - they cause false positives
       if (txType === "SWAP") {
-        const tokenTransfers = tx.tokenTransfers || [];
-        const nativeTransfers = tx.nativeTransfers || [];
-
-        // Find tokens received by wallet (not SOL)
-        const receivedTokens = tokenTransfers.filter(
-          (t: any) =>
-            t.toUserAccount === walletAddress && t.mint !== this.NATIVE_SOL_MINT
-        );
-
-        // Also check if wallet is sending tokens (creator providing liquidity)
-        const sentTokens = tokenTransfers.filter(
-          (t: any) =>
-            t.fromUserAccount === walletAddress &&
-            t.mint !== this.NATIVE_SOL_MINT
-        );
-
         console.log(
-          `[Helius DEBUG] PUMP_FUN SWAP analysis for ${tx.signature}:`
+          `[Helius] ❌ Skipping PUMP_FUN SWAP (not a creation): ${tx.signature}`
         );
-        console.log(
-          `[Helius DEBUG] - tokenTransfers.length: ${tokenTransfers.length}`
-        );
-        console.log(
-          `[Helius DEBUG] - receivedTokens.length: ${receivedTokens.length}`
-        );
-        console.log(`[Helius DEBUG] - sentTokens.length: ${sentTokens.length}`);
-        if (tokenTransfers.length > 0) {
-          console.log(
-            `[Helius DEBUG] - First transfer: to=${tokenTransfers[0].toUserAccount?.slice(0, 10)}, from=${tokenTransfers[0].fromUserAccount?.slice(0, 10)}, mint=${tokenTransfers[0].mint?.slice(0, 15)}`
-          );
-        }
-
-        if (receivedTokens.length > 0 || sentTokens.length > 0) {
-          // Use received tokens first, then sent tokens
-          const relevantTransfer =
-            receivedTokens.length > 0 ? receivedTokens[0] : sentTokens[0];
-          const tokenAmount = parseFloat(relevantTransfer.tokenAmount || "0");
-          const mintAddress = relevantTransfer.mint;
-
-          // Calculate SOL spent in this transaction
-          const solSpent =
-            nativeTransfers
-              .filter((t: any) => t.fromUserAccount === walletAddress)
-              .reduce(
-                (sum: number, t: any) => sum + Math.abs(t.amount || 0),
-                0
-              ) / 1e9;
-
-          // ADVANCED DETECTION: Multiple signals for token creation
-          const tokenToSolRatio = tokenAmount / (solSpent || 0.001); // Avoid division by zero
-          const isFirstInteraction = this.isFirstTokenInteraction(
-            tx,
-            mintAddress,
-            walletAddress
-          );
-
-          const isLikelyCreator =
-            // Signal 1: Large token amounts (creators get initial supply)
-            tokenAmount > 50000 ||
-            // Signal 2: High token-to-SOL ratio (creators get lots of tokens for little SOL)
-            tokenToSolRatio > 100000 ||
-            // Signal 3: Very small SOL spent with decent tokens (creation fee pattern)
-            (tokenAmount > 1000 && solSpent < 0.1) ||
-            // Signal 4: Description mentions creation
-            description.includes("created") ||
-            description.includes("launched") ||
-            description.includes("deploy") ||
-            description.includes("mint") ||
-            // Signal 5: First interaction with this token (likely creation)
-            isFirstInteraction ||
-            // Signal 6: Round token amounts (often initial supply)
-            this.isRoundTokenAmount(tokenAmount);
-
-          if (isLikelyCreator) {
-            console.log(
-              `[Helius] ✅ FOUND PUMP_FUN TOKEN CREATION: ${tx.signature}, mint=${mintAddress?.slice(0, 15)}, tokens=${tokenAmount}, solSpent=${solSpent}`
-            );
-            return true;
-          }
-
-          // Log rejected transactions for debugging
-          console.log(
-            `[Helius] ❌ Skipping PUMP_FUN buy: tokens=${tokenAmount}, solSpent=${solSpent}, mint=${mintAddress?.slice(0, 15)}`
-          );
-        } else {
-          console.log(
-            `[Helius] ❌ No token transfers found in PUMP_FUN SWAP: ${tx.signature}`
-          );
-        }
+        return false;
       }
 
       // Reject other pump.fun transaction types (WITHDRAW, TRANSFER, etc.)
@@ -1267,40 +1204,11 @@ export class HeliusProvider extends BaseProvider {
     return false;
   }
 
-  /**
-   * Check if this is the first interaction with a token (likely creation)
-   */
-  private isFirstTokenInteraction(
-    tx: any,
-    mintAddress: string,
-    walletAddress: string
-  ): boolean {
-    // This is a heuristic - in a full implementation, we'd track all seen tokens
-    // For now, we'll use transaction timestamp and other signals
-    const timestamp = tx.timestamp || 0;
-    const currentTime = Date.now() / 1000;
-    const ageInHours = (currentTime - timestamp) / 3600;
-
-    // If transaction is very recent (< 1 hour) and involves new token, likely creation
-    return ageInHours < 1;
-  }
-
-  /**
-   * Check if token amount looks like initial supply (round numbers)
-   */
-  private isRoundTokenAmount(amount: number): boolean {
-    // Check for round numbers that suggest initial supply
-    const roundPatterns = [
-      1000000, // 1M
-      10000000, // 10M
-      100000000, // 100M
-      1000000000, // 1B
-    ];
-
-    return roundPatterns.some(
-      (pattern) => Math.abs(amount - pattern) / pattern < 0.1 // Within 10% of round number
-    );
-  }
+  // Removed unreliable heuristic functions that caused false positives:
+  // - isFirstTokenInteraction: Was flagging any transaction < 1 hour old as creation
+  // - isRoundTokenAmount: Was flagging purchases of round token amounts as creation
+  // Token creation detection now relies ONLY on explicit transaction types (CREATE, CREATE_POOL)
+  // and InitializeMint instructions where wallet is the mint authority
 
   /**
    * Extract token info from a pump.fun transaction
