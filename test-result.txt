@@ -1,0 +1,40 @@
+
+=== WALLET ANALYSIS ===
+Address: GKzLcdPQLZwxiaFDfBUj9Gz77wU13eQzDfkjHYXLSbCs
+Score: 44
+Blockchain: solana
+
+=== TOKEN SUMMARY ===
+Total: 3
+Success: 0
+Rugged: 1
+Unknown: 2
+
+=== TOKEN DETAILS ===
+
+The Official XMAS67 Coin:
+  Outcome: rug
+  Reason: High developer sell-off: 100.0% of tokens sold
+  DevSellRatio: 1
+  Holders: 196
+  Initial Liq: 159
+  Current Liq: 34.251252522857165
+  Locked: true
+
+GTA AI Gooner Assistant:
+  Outcome: unknown
+  Reason: Liquidity declining: 43.59 SOL (27% of initial)
+  DevSellRatio: 0
+  Holders: 10
+  Initial Liq: 159
+  Current Liq: 43.58586380952377
+  Locked: true
+
+trillions:
+  Outcome: unknown
+  Reason: Liquidity declining: 33.26 SOL (21% of initial)
+  DevSellRatio: 0
+  Holders: 10
+  Initial Liq: 159
+  Current Liq: 33.262663868888886
+  Locked: true

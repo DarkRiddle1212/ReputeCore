@@ -1,0 +1,14 @@
+=== RUG WALLET TEST ===
+Address: 911jgDyLwiSszYoH2cmntXTX5QeMo37tWB6dSpTmKhTc
+Score: 26
+Total Launched: 1
+Rugged: 1
+Success: 0
+Unknown: 0
+
+=== TOKENS ===
+
+Laughing gas kid:
+  Outcome: rug
+  Reason: High developer sell-off: 100.0% of tokens sold
+  DevSellRatio: 1

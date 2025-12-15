@@ -1,0 +1,69 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../lib/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model TokenLaunch {
+  id                String   @id @default(uuid())
+  token             String
+  name              String?
+  symbol            String?
+  creator           String
+  launchAt          DateTime
+  outcome           String
+  reason            String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @default(now()) @updatedAt
+  initialLiquidity  Float?
+  holdersAfter7Days Int?
+  liquidityLocked   Boolean?
+  devSellRatio      Float?
+  marketCap         Float?
+  volume24h         Float?
+  blockchain        String   @default("ethereum")
+
+  @@unique([token, creator, blockchain], name: "token_creator_blockchain", map: "token_creator_blockchain")
+  @@index([creator, blockchain])
+  @@index([blockchain])
+  @@index([outcome])
+  @@index([launchAt])
+  @@index([creator])
+}
+
+model WalletAnalysis {
+  id            String   @id @default(uuid())
+  address       String   @unique
+  score         Int
+  breakdown     Json
+  notes         String[]
+  lastAnalyzed  DateTime @default(now())
+  analysisCount Int      @default(1)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @default(now()) @updatedAt
+  blockchain    String   @default("ethereum")
+
+  @@unique([address, blockchain])
+  @@index([blockchain])
+  @@index([score])
+  @@index([lastAnalyzed])
+}
+
+model ApiRequest {
+  id        String   @id @default(uuid())
+  address   String?
+  ipAddress String
+  userAgent String?
+  success   Boolean
+  duration  Int
+  error     String?
+  timestamp DateTime @default(now())
+
+  @@index([ipAddress])
+  @@index([timestamp])
+  @@index([success])
+}
