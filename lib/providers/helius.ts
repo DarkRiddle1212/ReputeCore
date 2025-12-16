@@ -14,6 +14,11 @@ import {
 } from "@/lib/errors";
 import { isValidSolanaAddress, normalizeSolanaAddress } from "@/lib/validation";
 import { logger } from "@/lib/logger";
+import {
+  TokenDetectionOrchestrator,
+  createDetectionOrchestrator,
+  DetectionResult,
+} from "@/lib/solana-detection";
 
 /**
  * Retry configuration for API calls
@@ -72,8 +77,10 @@ export class HeliusProvider extends BaseProvider {
   private rpcUrl: string;
   private lastCallTime = 0;
   private readonly RATE_LIMIT_DELAY_MS = 200; // 200ms = 5 calls/sec
+  private orchestrator: TokenDetectionOrchestrator | null = null;
+  private useEnhancedDetection: boolean = true; // Feature flag for new detection system
 
-  constructor(apiKey: string) {
+  constructor(apiKey: string, useEnhancedDetection: boolean = true) {
     super({
       name: "Helius",
       priority: 2, // Lower priority than Etherscan
@@ -84,6 +91,13 @@ export class HeliusProvider extends BaseProvider {
     this.apiKey = apiKey;
     // Updated RPC URL format - Helius uses rpc.helius.xyz now
     this.rpcUrl = `https://rpc.helius.xyz/?api-key=${apiKey}`;
+    this.useEnhancedDetection = useEnhancedDetection;
+
+    // Initialize enhanced detection orchestrator if enabled
+    if (this.useEnhancedDetection) {
+      this.orchestrator = createDetectionOrchestrator(apiKey);
+      console.log("[Helius] Enhanced token detection enabled");
+    }
   }
 
   /**
@@ -339,6 +353,63 @@ export class HeliusProvider extends BaseProvider {
 
     const normalizedAddress = normalizeSolanaAddress(address);
 
+    // Use enhanced detection if enabled (Requirement 5.2, 5.3)
+    if (this.useEnhancedDetection && this.orchestrator) {
+      return this.getTokensCreatedEnhanced(normalizedAddress, forceRefresh);
+    }
+
+    // Fall back to legacy detection
+    return this.getTokensCreatedLegacy(normalizedAddress);
+  }
+
+  /**
+   * Enhanced token detection using the new orchestrator
+   * Supports forceRefresh to bypass cache (Requirement 5.3)
+   */
+  private async getTokensCreatedEnhanced(
+    address: string,
+    forceRefresh?: boolean
+  ): Promise<TokenSummary[]> {
+    try {
+      console.log(`[Helius] Using enhanced detection for ${address}`);
+
+      const result = await this.orchestrator!.detectTokens(
+        address,
+        undefined,
+        forceRefresh ?? false
+      );
+
+      console.log(
+        `[Helius] Enhanced detection found ${result.tokens.length} tokens ` +
+        `(scan: ${result.scanMetadata.scanComplete ? 'complete' : 'partial'}, ` +
+        `${result.scanMetadata.scanDurationMs}ms)`
+      );
+
+      // Convert EnrichedTokenSummary to TokenSummary and enrich with additional data
+      const tokens = result.tokens.map((t) => ({
+        token: t.token,
+        name: t.name,
+        symbol: t.symbol,
+        launchAt: t.launchAt,
+        creator: address,
+        initialLiquidity: 0,
+        currentLiquidity: 0,
+      }));
+
+      // Enrich tokens with liquidity and holder data (limit to first 10)
+      return this.enrichTokens(tokens, address);
+    } catch (error) {
+      console.error(`[Helius] Enhanced detection failed, falling back to legacy:`, error);
+      return this.getTokensCreatedLegacy(address);
+    }
+  }
+
+  /**
+   * Legacy token detection (original implementation)
+   */
+  private async getTokensCreatedLegacy(
+    normalizedAddress: string
+  ): Promise<TokenSummary[]> {
     return this.executeRequest(async () => {
       return retry(
         async () => {
@@ -462,7 +533,81 @@ export class HeliusProvider extends BaseProvider {
           },
         }
       );
-    }, "getTokensCreated");
+    }, "getTokensCreatedLegacy");
+  }
+
+  /**
+   * Enrich tokens with liquidity, holder count, and metadata
+   * Shared by both enhanced and legacy detection
+   */
+  private async enrichTokens(
+    tokens: TokenSummary[],
+    walletAddress: string
+  ): Promise<TokenSummary[]> {
+    if (tokens.length === 0) {
+      return [];
+    }
+
+    try {
+      const tokensWithData = await Promise.all(
+        tokens.slice(0, 10).map(async (token) => {
+          try {
+            const [liquidity, holderCount, devSellData, initialLiq, metadata] =
+              await Promise.all([
+                this.getTokenLiquidity(token.token),
+                this.getTokenHolderCount(token.token),
+                this.calculateDevSellRatio(token.token, walletAddress),
+                !token.initialLiquidity || token.initialLiquidity === 0
+                  ? this.fetchInitialLiquidity(token.token)
+                  : Promise.resolve(token.initialLiquidity),
+                !token.name ||
+                token.name === "Pump.fun Token" ||
+                token.name === "Unknown Token" ||
+                /^\d+$/.test(token.name || "")
+                  ? this.getTokenMetadata(token.token)
+                  : Promise.resolve(null),
+              ]);
+
+            let name = token.name;
+            let symbol = token.symbol;
+            if (metadata) {
+              if (metadata.name && !/^\d+$/.test(metadata.name)) {
+                name = metadata.name;
+              }
+              if (metadata.symbol && !/^\d+$/.test(metadata.symbol)) {
+                symbol = metadata.symbol;
+              }
+            }
+            if (!name || /^\d+$/.test(name)) {
+              name = `Token ${token.token.slice(0, 6)}...`;
+              symbol = symbol || token.token.slice(0, 4).toUpperCase();
+            }
+
+            return {
+              ...token,
+              name,
+              symbol,
+              initialLiquidity: initialLiq || token.initialLiquidity,
+              currentLiquidity:
+                liquidity?.currentLiquidity ?? token.currentLiquidity,
+              liquidityLocked:
+                liquidity?.liquidityLocked ?? token.liquidityLocked ?? true,
+              holdersAfter7Days: holderCount,
+              devSellRatio: devSellData.devSellRatio,
+            };
+          } catch (e) {
+            console.warn(`Failed to enrich token ${token.token}:`, e);
+            return token;
+          }
+        })
+      );
+
+      const remainingTokens = tokens.slice(10);
+      return [...tokensWithData, ...remainingTokens];
+    } catch (error) {
+      console.warn(`[Helius] Token enrichment failed:`, error);
+      return tokens;
+    }
   }
 
   // Pump.fun program ID
@@ -882,23 +1027,24 @@ export class HeliusProvider extends BaseProvider {
 
   /**
    * Get pump.fun tokens created by this address
-   * Paginates through all transactions to find all token launches
+   * Uses type=CREATE filter to efficiently fetch only token creation transactions
    */
   private async getPumpFunTokens(address: string): Promise<TokenSummary[]> {
     const tokens: TokenSummary[] = [];
     const seenMints = new Set<string>();
     let beforeSignature: string | undefined = undefined;
     let totalFetched = 0;
-    const MAX_TRANSACTIONS = 1000; // Limit to 1000 transactions for performance (most token creations are recent)
+    const MAX_TRANSACTIONS = 1000; // Limit to 1000 CREATE transactions
 
     try {
       console.log(`[Helius] Starting pump.fun token search for ${address}`);
 
-      // Paginate through all transactions
+      // Use type=CREATE filter to get all CREATE transactions directly
+      // This is more efficient and avoids missing tokens due to pagination
       while (totalFetched < MAX_TRANSACTIONS) {
         const txUrl: string = beforeSignature
-          ? `${this.baseUrl}/addresses/${address}/transactions?api-key=${this.apiKey}&limit=100&before=${beforeSignature}`
-          : `${this.baseUrl}/addresses/${address}/transactions?api-key=${this.apiKey}&limit=100`;
+          ? `${this.baseUrl}/addresses/${address}/transactions?api-key=${this.apiKey}&type=CREATE&limit=100&before=${beforeSignature}`
+          : `${this.baseUrl}/addresses/${address}/transactions?api-key=${this.apiKey}&type=CREATE&limit=100`;
 
         const txResponse: Response = await fetch(txUrl, { method: "GET" });
 
@@ -916,15 +1062,13 @@ export class HeliusProvider extends BaseProvider {
 
         totalFetched += transactions.length;
         console.log(
-          `[Helius] Fetched ${transactions.length} transactions (total: ${totalFetched})`
+          `[Helius] Fetched ${transactions.length} CREATE transactions (total: ${totalFetched})`
         );
 
-        // Log unique transaction types for debugging
-        const types = [...new Set(transactions.map((t: any) => t.type))];
+        // Log unique sources for debugging
         const sources = [...new Set(transactions.map((t: any) => t.source))];
 
         if (totalFetched <= 100) {
-          console.log(`[Helius DEBUG] Transaction types: ${types.join(", ")}`);
           console.log(
             `[Helius DEBUG] Transaction sources: ${sources.join(", ")}`
           );
@@ -947,7 +1091,7 @@ export class HeliusProvider extends BaseProvider {
           }
         }
 
-        // Log ALL pump.fun transactions where wallet is fee payer
+        // Filter for pump.fun CREATE transactions where wallet is fee payer
         const pumpFunTxs = transactions.filter(
           (t: any) =>
             (t.source === "PUMP_FUN" ||
