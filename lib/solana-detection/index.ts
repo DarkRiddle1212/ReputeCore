@@ -22,14 +22,15 @@ export { DetectionCache, detectionCache } from "./DetectionCache";
 export { MintAuthorityVerifier } from "./MintAuthorityVerifier";
 
 // Orchestrator
-export { TokenDetectionOrchestrator, OrchestratorConfig } from "./TokenDetectionOrchestrator";
+export { TokenDetectionOrchestrator } from "./TokenDetectionOrchestrator";
+export type { OrchestratorConfig } from "./TokenDetectionOrchestrator";
 
 // Strategy base
-export {
+export type {
   IDetectionStrategy,
-  BaseDetectionStrategy,
   StrategyConfig,
 } from "./strategies/DetectionStrategy";
+export { BaseDetectionStrategy } from "./strategies/DetectionStrategy";
 
 // Detection strategies
 export { PumpFunDetector } from "./strategies/PumpFunDetector";
